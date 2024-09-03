@@ -1,5 +1,5 @@
 /*
-    htpdate v1.3.7
+    htpdate v2.0.0
 
     Eddy Vervest <eddy@vervest.org>
     http://www.vervest.org/htp
@@ -49,6 +49,7 @@
 #include <syslog.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <math.h>
 #include <pwd.h>
 #include <grp.h>
 #include <float.h>
@@ -61,7 +62,17 @@
 #include <openssl/ssl.h>
 #endif
 
-#define VERSION                  "1.3.7"
+#define LICENSE "\
+Copyright (C) 2004-2024 Eddy Vervest.\n\
+\n\
+This program is free software; you can redistribute it and/or modify\n\
+it under the terms of the GNU General Public License as published by\n\
+the Free Software Foundation; either version 2 of the License, or (at\n\
+your option) any later version.\n\
+\n\
+There is NO WARRANTY, to the extent permitted by law."
+
+#define VERSION                  "2.0.0"
 #define MAX_HTTP_HOSTS           16                /* 16 web servers */
 #define DEFAULT_HTTP_PORT        "80"
 #define DEFAULT_PROXY_PORT       "8080"
@@ -71,7 +82,7 @@
 #define NO_TIME_LIMIT            -1
 #define ERR_TIMESTAMP            DBL_MAX          /* Err fetching date in getHTTPdate */
 #define DEFAULT_PRECISION        4                 /* 4 request per host */
-#define DEFAULT_MIN_SLEEP        1800              /* 30 minutes */
+#define DEFAULT_MIN_SLEEP        900               /* 15 minutes */
 #define DEFAULT_MAX_SLEEP        115200            /* 32 hours */
 #define MAX_DRIFT                32768000          /* 500 PPM */
 #define DEFAULT_PID_FILE         "/var/run/htpdate.pid"
@@ -111,10 +122,20 @@ static void printlog(int is_error, char *format, ...) {
     (void) vsnprintf(buf, sizeof(buf), format, args);
     va_end(args);
 
-    if (logmode)
-        syslog(is_error?LOG_WARNING:LOG_INFO, "%s", buf);
-    else
-        fprintf(is_error?stderr:stdout, "%s\n", buf);
+    switch(logmode) {
+        case 0:
+            fprintf(is_error?stderr:stdout, "%s\n", buf);
+            break;
+        case 1:
+            syslog(is_error?LOG_WARNING:LOG_INFO, "%s", buf);
+            break;
+        case 2:
+            fprintf(stderr, "%s\n", buf);
+            break;
+        default:
+            fprintf(stderr, "%s\n", "Invalid logmode, aborting");
+            abort();
+    }
 }
 
 
@@ -177,7 +198,7 @@ static void splitURL(char **scheme, char **host, char **port, char **path) {
 }
 
 
-static void swuid(int id) {
+static void swuid(unsigned int id) {
     if (seteuid(id)) {
         printlog(1, "seteuid() %i", id);
         exit(1);
@@ -185,7 +206,7 @@ static void swuid(int id) {
 }
 
 
-static void swgid(int id) {
+static void swgid(unsigned int id) {
     if (setegid(id)) {
         printlog(1, "setegid() %i", id);
         exit(1);
@@ -210,7 +231,7 @@ static long long getoffset(char remote_time[25]) {
 
 
 static int sendHEAD(int server_s, char *headrequest, char *buffer) {
-    int ret = send(server_s, headrequest, strlen(headrequest), 0);
+    int ret = (int)send(server_s, headrequest, strlen(headrequest), 0);
 
     if (ret < 0) {
         printlog(1, "Error sending");
@@ -376,7 +397,8 @@ static double getHTTPdate(
     #endif
 
     long long offset = 0, first_offset = 0, prev_offset = 0;
-    long nap = 1e9L;
+    long nap = 1000000000;
+    long latency = 0;
     long when = nap >> precision;
     do {
         if (debug > 1)
@@ -390,12 +412,13 @@ static double getHTTPdate(
 
         /* Wait till we reach the desired time, "when" */
         sleepspec.tv_sec = 0;
-        if (when >= now.tv_nsec) {
-            sleepspec.tv_nsec = when - now.tv_nsec;
+        if (when - latency >= now.tv_nsec) {
+            sleepspec.tv_nsec = when - now.tv_nsec - latency;
         } else {
-            sleepspec.tv_nsec = 1e9 + when - now.tv_nsec;
+            sleepspec.tv_nsec = 1000000000 + when - now.tv_nsec - latency;
             rtt++;
         }
+
         nanosleep(&sleepspec, NULL);
 
         /* Send HEAD request */
@@ -414,7 +437,14 @@ static double getHTTPdate(
             clock_gettime(CLOCK_REALTIME, &now);
 
             /* rtt contains round trip time in nanoseconds */
-            rtt = (now.tv_sec - rtt) * 1e9 + now.tv_nsec - when;
+            rtt = (now.tv_sec - rtt) * 1000000000 + now.tv_nsec - when + latency;
+
+             /* Obtain rtt/latency first */
+            if (latency == 0) {
+                latency = rtt / 2;
+                continue;
+            }
+            latency = rtt / 2;
 
             /* Look for the line that contains [dD]ate: */
             if ((pdate = strcasestr(buffer, "date: ")) != NULL && strlen(pdate) >= 35) {
@@ -457,23 +487,23 @@ static double getHTTPdate(
     /* Rounding */
     if (debug) printlog(0, "when: %ld, nap: %ld", when, nap);
     if (offset == LLONG_MAX) return(ERR_TIMESTAMP);
-    if (when + nap == 1e9 && offset == 0) return 0;
+    if (when + nap == 1000000000 && offset == 0) return 0;
 
     /* Return the time delta between web server time (timevalue)
        and system time (now)
     */
     if (first_offset < 0) {
-        return(-first_offset + (1e9L-when)/(double)1e9L);
+        return((double)-first_offset + (1000000000-(double)when)/1000000000);
     } else {
-        return(-first_offset + 1 - when/(double)1e9L);
+        return((double)-first_offset + 1 - ((double)when/1000000000));
     }
 }
 
 
-static int setstatus(int precision) {
+static int setstatus() {
     struct timex txc = {0};
 
-    txc.modes = MOD_STATUS | (1000000 >> precision) | MOD_MAXERROR;
+    txc.modes = MOD_STATUS | MOD_ESTERROR | MOD_MAXERROR;
     txc.status &= ~STA_UNSYNC;
     printlog(0, "Set clock synchronized");
 
@@ -493,13 +523,13 @@ static int setclock(double timedelta, int setmode) {
 
     switch (setmode) {
         case 0:                        /* No time adjustment, just print time */
-            printlog(0, "Offset %.3f seconds", timedelta);
+            printlog(0, "Offset %.1f ms", timedelta * 1e3);
             return(0);
         case 1:                        /* Adjust time smoothly */
             timeofday.tv_sec  = (long)timedelta;
-            timeofday.tv_usec = (long)((timedelta - timeofday.tv_sec) * 1e6);
+            timeofday.tv_usec = (long)((timedelta - (double)timeofday.tv_sec) * 1e6);
 
-            printlog(0, "Adjusting %.3f seconds", timedelta);
+            printlog(0, "Adjusting %.1f ms", timedelta * 1e3);
 
             /* Become root */
             swuid(0);
@@ -508,10 +538,10 @@ static int setclock(double timedelta, int setmode) {
             printlog(0, "Setting %.3f seconds", timedelta);
 
             clock_gettime(CLOCK_REALTIME, &now);
-            timedelta += (now.tv_sec + now.tv_nsec * 1e-9);
+            timedelta += (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
 
             now.tv_sec  = (long)timedelta;
-            now.tv_nsec = (long)(timedelta - now.tv_sec) * 1e9;
+            now.tv_nsec = (long)((timedelta - (double)now.tv_sec) * 1e9);
 
             strftime(buffer, sizeof(buffer), "%c", localtime(&now.tv_sec));
             printlog(0, "Set time: %s", buffer);
@@ -560,18 +590,14 @@ static int init_frequency(char *driftfile) {
 
 static int htpdate_adjtimex(double drift, char *driftfile, float confidence) {
     struct timex    tmx;
-    long            freq;
     FILE            *fp;
 
     /* Read current clock frequency */
     tmx.modes = 0;
     adjtimex(&tmx);
 
-    /* Calculate new frequency */
-    freq = (long)(65536e6 * drift);
-
     /* Weighted average of current and new frequency */
-    tmx.freq = tmx.freq + freq * confidence;
+    tmx.freq = tmx.freq + (long int)(65536e6 * drift * confidence);
     if ((tmx.freq < -MAX_DRIFT) || (tmx.freq > MAX_DRIFT))
         tmx.freq = sign(tmx.freq) * MAX_DRIFT;
 
@@ -708,10 +734,10 @@ int main(int argc, char *argv[]) {
     int             noproxyenv = 0;
     int             ipversion = DEFAULT_IP_VERSION;
     long long       timelimit = DEFAULT_TIME_LIMIT;
-    int             minsleep = DEFAULT_MIN_SLEEP;
-    int             maxsleep = DEFAULT_MAX_SLEEP;
-    int             sleeptime = minsleep;
-    int             sw_uid = 0, sw_gid = 0;
+    unsigned int    minsleep = DEFAULT_MIN_SLEEP;
+    unsigned int    maxsleep = DEFAULT_MAX_SLEEP;
+    unsigned int    sleeptime = minsleep;
+    unsigned int    sw_gid = 0, sw_uid = 0;
     time_t          starttime = 0;
 
     struct passwd   *pw;
@@ -737,7 +763,7 @@ int main(int argc, char *argv[]) {
         case 'a':               /* adjust time */
             setmode = 1;
             break;
-        case 'c':               /* server certificat verification */
+        case 'c':               /* server certificate verification */
             verifycert = 1;
             break;
         case 'd':               /* turn debug on */
@@ -757,7 +783,7 @@ int main(int argc, char *argv[]) {
             logmode = 1;
             break;
         case 'm':               /* minimum poll interval */
-            if ((minsleep = atoi(optarg)) <= 0) {
+            if ((minsleep = (unsigned int)atoi(optarg)) <= 0) {
                 fputs("Invalid sleep time\n", stderr);
                 exit(1);
             }
@@ -792,20 +818,20 @@ int main(int argc, char *argv[]) {
                 sw_uid = pw->pw_uid;
                 sw_gid = pw->pw_gid;
             } else {
-                printf("Unknown user %s\n", user);
+                printlog(1, "Unknown user %s\n", user);
                 exit(1);
             }
             if (group != NULL) {
                 if ((gr = getgrnam(group)) != NULL) {
                     sw_gid = gr->gr_gid;
                 } else {
-                    printf("Unknown group %s\n", group);
+                    printlog(1, "Unknown group %s\n", group);
                     exit(1);
                 }
             }
             break;
         case 'v':               /* print version */
-            printf("htpdate version %s\n", VERSION);
+            puts("htpdate version "VERSION"\n"LICENSE"");
             exit(0);
         case 'x':               /* adjust time and clock frequency */
             setmode = 3;
@@ -818,9 +844,10 @@ int main(int argc, char *argv[]) {
             break;
         case 'F':               /* run daemon in foreground, don't fork */
             foreground = 1;
+            logmode = 2;
             break;
         case 'M':               /* maximum poll interval */
-            if ((maxsleep = atoi(optarg)) <= 0) {
+            if ((maxsleep = (unsigned int)atoi(optarg)) <= 0) {
                 fputs("Invalid sleep time\n", stderr);
                 exit(1);
             }
@@ -831,10 +858,8 @@ int main(int argc, char *argv[]) {
             proxy = proxywithport;
             splitURL(&scheme, &proxy, &proxyport, &path);
             break;
-        case '?':
-            return 1;
         default:
-            abort();
+            exit(1);
     }
 
     /* Display help page, if no servers are specified */
@@ -958,12 +983,11 @@ int main(int argc, char *argv[]) {
                 if (daemonize || foreground) {
                     if (starttime) {
                         /* Calculate systematic clock drift */
-                        drift = timeavg / (time(NULL) - starttime);
+                        drift = timeavg / (double)(time(NULL) - starttime);
                         printlog(0, "Drift %.2f PPM, %.2f s/day", drift*1e6, drift*86400);
 
                         /* Adjust system clock */
                         if (setmode == 3) {
-                            starttime = time(NULL);
                             /* Adjust the clock frequency */
                             if (htpdate_adjtimex(drift, driftfile, (float)sleeptime / (float)maxsleep) < 0)
                                 printlog(1, "Frequency change failed");
@@ -971,24 +995,24 @@ int main(int argc, char *argv[]) {
                             /* Drop root privileges again */
                             if (sw_uid) swuid(sw_uid);
                         }
-                    } else {
-                        starttime = time(NULL);
                     }
+
+                    starttime = time(NULL);
 
                     /* Decrease polling interval to minimum */
                     sleeptime = minsleep;
 
-                    /* Sleep for 30 minutes after a time adjust or set */
-                    sleep(DEFAULT_MIN_SLEEP);
+                    /* Sleep for some time after a time adjust or set */
+                    sleep((unsigned int)fabs(timeavg*2000));
                 }
             } else {
                 /* Increase polling interval */
                 if (sleeptime < maxsleep) sleeptime <<= 1;
-                if (setmode == 3) setstatus(precision);
+                if (setmode == 3) setstatus();
             }
 
             if (daemonize || foreground) {
-                printlog(0, "sleep for %ld s", sleeptime);
+                printlog(0, "Sleep %ld s", sleeptime);
                 sleep(sleeptime);
             }
 
