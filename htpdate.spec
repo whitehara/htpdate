@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           htpdate
-Version:        1.3.7
+Version:        2.0.0
 Release:        1
 Summary:        Htpdate will synchronize your computer's time by extracting timestamps from HTTP headers.
 
@@ -54,5 +54,8 @@ systemctl stop htpdate.service
 
 
 %changelog
-* Tue May 16 2023 Shiro Hara <white@vx-xv.com>
+* Tue Sep 03 2024 whitehara <white@vx-xv.com>
+- htpdate-2.0.0
+
+* Tue May 16 2023 whiterara <white@vx-xv.com>
 - htpdate-1.3.7
